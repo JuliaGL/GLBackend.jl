@@ -7,12 +7,15 @@ end
 
 immutable Backend{Identifier}
     typemap::Dict{DataType, String} #
-    funcnames::Dict{Tuple{String, Vector{DataType}}, FunctionSignature}
-    declared_functions::Dict{FunctionSignature, String} # name, arg_types
-    declared_types::Dict{String, Any} # typename
+    funcnames::Dict{Function, Dict{Pair, String}}
 end
 
-
+function Backend(sym::Symbol)
+    Backend{sym}(
+        Dict{DataType, String}(),
+        Dict{Function, Dict{Pair, String}}()
+    )
+end
 
 """
 Most backends don't support type parameters, so we need to embedd them in the name
