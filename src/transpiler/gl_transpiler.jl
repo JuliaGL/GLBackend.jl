@@ -1,11 +1,16 @@
 using FixedSizeArrays, GeometryTypes, Colors, GLAbstraction
 import GLAbstraction: opengl_prefix
 abstract TranspilerBackend
+
+immutable Declaration
+    dependencies::Vector{Declaration}
+    source::String
+end
+
 immutable Backend{Identifier} <: TranspilerBackend
-    declarations::Dict{String, Declaration}
+    #declarations::Dict{String, Declaration}
     type_map::Dict{DataType, String}
-    function_map::Dict{String, Dict{Pair, String}}
-    current_slots::Dict{Slot, Tuple{String,DataType}}
+    function_map::Dict{String, Tuple{String, DataType}}
 end
 
 """
@@ -17,12 +22,6 @@ immutable TExpr
 end
 returntype(x::TExpr) = x.typ
 source(x::TExpr) = x.source
-
-immutable Declaration
-    dependencies::Vector{Declaration}
-    source::String
-end
-
 
 typealias GL Backend{:GL}
 
@@ -138,11 +137,12 @@ function declare_composite_type{T}(backend::GL, ::Type{T})
     name = to_type_name(T)
     get!(backend.type_map, T) do
         fields = [to_type_assert(backend, n, fieldtype(T, n)) for n in fieldnames(T)]
-        """
+        println("""
         struct $(name){
             $(join(fields, ";\n"));
         };
-        """
+        """)
+        name
     end
     name
 end
@@ -151,13 +151,14 @@ get_types(x::Vector) = map(slot_name_t -> slot_name_t[2][2], x)
 
 function declare_function(backend::GL, func::FuncExpr)
     types = get_types(func.args)
-    name, rettype = get!(backend.function_map, (func.name, types))
+    name, rettype = get!(backend.function_map, (func.name, types)) do
         arg_decl = map(arg->to_type_assert(backend, arg[2]...), args)
-        """
+        println("""
         $(to_type_name(returntype)) $name($(arg_decl...)){
             $(transpile(backend, body))
         }
-        """
+        """)
+        name, returntype
     end
     name, rettype
 end
