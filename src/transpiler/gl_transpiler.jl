@@ -1,9 +1,11 @@
 using FixedSizeArrays, GeometryTypes, Colors, GLAbstraction
 import GLAbstraction: opengl_prefix
-
+abstract TranspilerBackend
 immutable Backend{Identifier} <: TranspilerBackend
-    type_map::Dict{DataType, String} #
+    declarations::Dict{String, Declaration}
+    type_map::Dict{DataType, String}
     function_map::Dict{String, Dict{Pair, String}}
+    current_slots::Dict{Slot, Tuple{String,DataType}}
 end
 
 """
@@ -13,7 +15,7 @@ immutable TExpr
     source::String
     typ::String
 end
-ret_type(x::TExpr) = x.typ
+returntype(x::TExpr) = x.typ
 source(x::TExpr) = x.source
 
 immutable Declaration
@@ -76,6 +78,9 @@ function insert_buildins!(backend::GL)
         "*" => "*",
         "+" => "+",
         "/" => "/",
+        # "div_float" => "/",
+        # "sub_float" => "-",
+        # "add_float" => "+"
     )
     boolfuns = [:all, :any]
     # TODO actually figure out the signature of the GLSL build-in functions
@@ -97,62 +102,97 @@ end
 const GLBackend = Backend(:GL)
 insert_buildins!(GLBackend)
 
-to_type_name(backend::GL, T) = backend.type_map[T]
-
-function to_type_assert(backend::GL, name::String, typ::String)
-    "$typ $name"
-end
-function to_type_assert(backend::GL, name, typ)
-    "$(to_type_name(backend, typ)) $(name)"
-end
-
-function declare_composite_type{T}(backend::GL, ::Type{T})
-    fields = [to_type_assert(backend, n, fieldtype(T, n)) for n in fieldnames(T)]
-    name = to_type_name(T)
-    """
-    struct $(name){
-        $(join(fields, ";\n"));
-    };
-    """
-end
-function declare_function(backend::GL, name, args, body, returntype)
-    args = map(arg->to_type_assert(backend, arg), args)
-    """
-    $(to_type_name(returntype)) $name($(args...)){
-        $(transpile(backend, body))
-    }
-    """
-end
 function declare_block(backend::GL, source::String)
     source*";\n"
 end
+isbox(x) = (x == GlobalRef(Base, :box))
+
+
+function to_type_name(backend::GL, T::DataType) 
+    get!(backend.type_map, T) do
+        declare_composite_type(backend, T)
+    end
+end
+function to_type_name(T)
+    join((T.name.name, T.parameters...), "_")
+end
+function to_type_assert(backend::GL, name::String, typ::String)
+
+    "$typ $name"
+end
+function to_type_assert(backend::GL, name, typ)
+    tn = to_type_name(backend, typ)
+    to_type_assert(name, tn)
+end
+
+function declare_slots(backend::GL, slots)
+    join(map(slots[2:end]) do slot_name_t
+        slot, (name, t) = slot_name_t
+        slot_declare = to_type_assert(backend, name, t)
+        declare_block(backend, slot_declare)
+    end, "")
+end
+
+
+function declare_composite_type{T}(backend::GL, ::Type{T})
+    name = to_type_name(T)
+    get!(backend.type_map, T) do
+        fields = [to_type_assert(backend, n, fieldtype(T, n)) for n in fieldnames(T)]
+        """
+        struct $(name){
+            $(join(fields, ";\n"));
+        };
+        """
+    end
+    name
+end
+
+get_types(x::Vector) = map(slot_name_t -> slot_name_t[2][2], x)
+
+function declare_function(backend::GL, func::FuncExpr)
+    types = get_types(func.args)
+    name, rettype = get!(backend.function_map, (func.name, types))
+        arg_decl = map(arg->to_type_assert(backend, arg[2]...), args)
+        """
+        $(to_type_name(returntype)) $name($(arg_decl...)){
+            $(transpile(backend, body))
+        }
+        """
+    end
+    name, rettype
+end
+
+
+function transpile(backend::GL, expr::Slot)
+    backend.current_slots[backend][1]
+end
 function transpile(backend::GL, expr::Expr, ::Val{:(=)})
     lh, rh = map(x->transpile(backend, x), expr.args)
-    @show typeof(lh)
     TExpr("$lh = $rh", Void)
 end
+
 function transpile(backend::GL, expr::Expr, ::Val{:call})
-    fun = expr.args[1]
-    if fun == GlobalRef(Base, :box) # ignore boxes, LOL
-        returntype = expr.args[2]
-        t = transpile(backend, expr[3], ::Val{:call})
-        @assert ret_type(t) == returntype
-        return TExpr(t.code,  ret_type(t))
+    fun = shift!(expr)
+    if isbox(fun) # ignore boxes, LOL \( ﾟ◡ﾟ)/
+        @assert length(expr.args) == 2
+        returntype, inner_expr = expr.args
+        t = transpile(backend, inner_expr)
+        @assert returntype(t) == returntype
+        return t
     end
+    # transpile function arguments
     args = map(x->transpile(backend, x), expr.args[2:end])
-    return_type = declare_function(backend, f, args.ret_type.(args))
-    call_expr = if Base.isoperator(fun)
+    fun_name, return_type = transpile(backend, fun, returntype.(args))
+    transpilat = source.(args)
+    call_expr = if Base.isoperator(fun_name) # most Julia operators should also be operators in GLSL
         @assert length(args) == 2
-        "$(args[1]) $fun $(args[2])"
+        "$(transpilat[1]) $fun_name $(transpilat[2])"
     else
-        "$fun($(join(args, ", ")))"
+        "$fun_name($(join(transpilat, ", ")))"
     end
     TExpr(call_expr, return_type)
 end
-function transpile(backend::GL, expr::Expr, ::Val{:line})
-    expr = transpile(backend, expr)
 
-end
 function transpile(backend::GL, expr::Expr, ::Val{:if})
     cond, _if, _else = map(x->transpile(backend, x), expr.args)
     TExpr("""
@@ -161,32 +201,19 @@ function transpile(backend::GL, expr::Expr, ::Val{:if})
     }else{
         $_else
     }
-    """, Void)
+    """, Void) # Semantic change between Julia vs GLSL. Retype in Julia would be smth like Union{_if, _else}
 end
 
 function type_lookup(backend::GL, x::SlotNumber)
     backend.current_slots[x][2]
 end
 function type_lookup(backend::GL, x::TExpr)
-    ret_type(x)
+    returntype(x)
 end
 function type_lookup(backend::GL, x::Expr)
     if x.head == :(::)
         return x.args[2]
     end
-    error("I'm afraid I cant infer type of $x")
+    error("I'm afraid I cant infer type of $x, dave")
 end
 
-function transpile(backend::GL, block::Expr)
-    if block.head == :block || block.head == :body
-        lines = map(block.args) do elem
-            transpile(backend, elem)
-        end
-        block_source = join(lines) do line
-            declare_block(backend, source(line))
-        end
-        return TExpr(join(block_source, ""), ret_type(last(lines)))
-    else
-        return transpile(backend, block, Val{block.head}())
-    end
-end
