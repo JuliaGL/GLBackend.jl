@@ -492,15 +492,15 @@ function transpile(backend::GL, expr::Expr, ::Val{:call})
     end
     TExpr(call_expr, return_type)
 end
+
 function transpile(backend::GL, expr::Expr, ::Val{:return})
     src = transpile(backend, expr.args[1])
     TExpr("return $(source(src))", returntype(src))
 end
 
-
 # Test
 
-function blinnphong3{NV, T}(light, L::Vec{NV, T}, N, V, color, shading)
+function blinnphong4{NV, T}(light, L::Vec{NV, T}, N, V, color, shading)
     diff_coeff = max(dot(L,N), T(0.0))
     # specular coefficient
     H = normalize(L+V)
@@ -514,6 +514,7 @@ function blinnphong3{NV, T}(light, L::Vec{NV, T}, N, V, color, shading)
         spec_coeff += 1.0;
     else
         spec_coeff = spec_coeff;
+        return L
     end
     # final lighting model
     return Vec3f0(
@@ -523,11 +524,10 @@ function blinnphong3{NV, T}(light, L::Vec{NV, T}, N, V, color, shading)
     )
 end
 
-
 l = Light(Vec3f0(0), Vec3f0(0), Vec3f0(0), 1f0, Vec3f0(0), 1f0)
 s = Shading(Vec3f0(0), Vec3f0(0), 1f0)
 blinnphong3(l, Vec3f0(0), Vec3f0(0), Vec3f0(0), Vec3f0(0), s)
 fe = FuncExpr(blinnphong3, (Light{Float32},Vec3f0, Vec3f0, Vec3f0, Vec3f0,Shading{Float32}))
 fe.slots
-transpile(GLBackend, blinnphong3, (Light{Float32},Vec3f0, Vec3f0, Vec3f0, Vec3f0,Shading{Float32}))
+transpile(GLBackend, blinnphong4, (Light{Float32},Vec3f0, Vec3f0, Vec3f0, Vec3f0,Shading{Float32}))
 #delete!(GLBackend.function_map, ("blinnphong3", [Light{Float32},Vec3f0, Vec3f0, Vec3f0, Vec3f0,Shading{Float32}]))

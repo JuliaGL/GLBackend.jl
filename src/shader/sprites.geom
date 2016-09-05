@@ -4,6 +4,7 @@
 layout(points) in;
 layout(triangle_strip, max_vertices = 4) out;
 
+uniform bool scale_primitive;
 uniform bool billboard;
 uniform float stroke_width;
 uniform float glow_width;
@@ -66,25 +67,29 @@ vec4 _position(vec2 position, sampler2D heightfield, int index){
 
 void emit_vertex(vec2 vertex, vec2 uv, vec2 uv_offset)
 {
-    vec4 final_position = model*vec4(g_position[0], 1);
-
-    if(billboard){
-        final_position = projection*view*final_position;
-        gl_Position    = final_position + (projection*vec4(vertex, 0, 0));
-    }else{
-        mat3 rot       = rotation_mat(g_rotation[0]);
-        final_position = final_position+vec4(rot*vec3(vertex, 0), 0);
-        gl_Position    = projection*view*final_position;
-    }
-
-    f_uv              = uv;
-    f_uv_offset       = uv_offset;
-    f_primitive_index = g_primitive_index[0];
-    f_color           = g_color[0];
-    f_stroke_color    = g_stroke_color[0];
-    f_glow_color      = g_glow_color[0];
-    f_scale           = g_offset_width[0].zw;
-    f_id              = g_id[0];
+    // vec4 sprite_position, final_position;
+    // vec3 datapoint = projection*view*model*vec4(g_position[0], 1);
+    // if(true)
+    //     final_position = model*vec4(vertex, 0, 0);
+    // else{
+    //     final_position = vec4(vertex, 0, 0);
+    // }
+    // if(billboard){
+    //     final_position = projection*view*final_position;
+    // }else{
+    //     mat3 rot       = rotation_mat(g_rotation[0]);
+    //     final_position = projection*view*vec4(rot*vec3(final_position), 0);
+    // }
+    // gl_Position = datapoint+final_position;
+    //
+    // f_uv              = uv;
+    // f_uv_offset       = uv_offset;
+    // f_primitive_index = g_primitive_index[0];
+    // f_color           = g_color[0];
+    // f_stroke_color    = g_stroke_color[0];
+    // f_glow_color      = g_glow_color[0];
+    // f_scale           = g_offset_width[0].zw;
+    // f_id              = g_id[0];
 
     EmitVertex();
 }

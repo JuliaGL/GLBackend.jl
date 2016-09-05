@@ -88,7 +88,6 @@ insert_glyph!(atlas::TextureAtlas, glyph::Char, font) = get!(atlas.mapping, (gly
     relative_start = real_start ./ tex_size # use normalized texture coordinates
     relative_width = (real_start+width_nopadd) ./ tex_size
 
-    bearing         = extent.horizontal_bearing
     uv_offset_width = Vec4f0(relative_start..., relative_width...)
     i               = atlas.index
     push!(atlas.attributes, uv_offset_width)
