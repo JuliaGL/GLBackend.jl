@@ -1,57 +1,10 @@
+include("transpiler.jl")
 using FixedSizeArrays, GeometryTypes, Colors, GLAbstraction
 import GLAbstraction: opengl_prefix
-abstract TranspilerBackend
 
-immutable FuncExpr
-    name::Symbol
-    slots
-    args
-    body::Vector
-    returntype::DataType
-    static_parameters::Tuple
+@noinline function glsl_call{T}(glsl_str, ret_t::Type{T}, arg_t, args...)
+    unsafe_load(Ptr{T}(C_NULL))::T
 end
-
-immutable Light{T}
-    position::Vec{3,T}
-    ambient::Vec{3,T}
-    diffuse::Vec{3,T}
-    diffuse_power::T
-    specular::Vec{3,T}
-    specular_power::T
-end
-
-immutable Shading{T}
-    ambient::Vec{3, T}
-    specular::Vec{3, T}
-    shininess::T
-end
-function get_lambda(pass, f, types)
-    lambda = pass(f, types)
-    if isa(lambda, Vector)
-        if isempty(lambda)
-            args = join(map(t->"::$t", types), ", ")
-            error("$f($args) couldn't be found")
-        end
-        return first(lambda)
-    else
-        isa(lambda, LambdaInfo) && return lambda
-        error("Not sure what's up with returntype of $pass. Returned: $lambda")
-    end
-end
-
-function FuncExpr(f, types)
-    lam_lowered = get_lambda(code_lowered, f, types)
-    lam_typed = get_lambda(code_typed, f, types)
-    slotnames = Base.lambdainfo_slotnames(lam_lowered)
-    slottypes = lam_typed.slottypes
-    nargs = length(types)
-    slots = [(SlotNumber(i), (replace(name, "@", ""), slottypes[i])) for (i, name) in enumerate(slotnames)]
-    ast = Base.uncompressed_ast(lam_lowered)
-    name = Symbol(f)
-    static_params = tuple(lam_typed.sparam_vals...)
-    FuncExpr(name, slots, view(slots, 2:(nargs+1)), ast, lam_typed.rettype, static_params)
-end
-
 
 immutable Declaration
     dependencies::Vector{Declaration}
@@ -60,17 +13,12 @@ end
 
 type Backend{Identifier} <: TranspilerBackend
     #declarations::Dict{String, Declaration}
-    current_slots::Vector{Dict{Slot, Tuple{String, DataType}}}
+    current_slots::Vector{Dict{Any, Tuple{String, DataType}}}
     type_map::Dict{DataType, String}
     function_map::Dict{Tuple{String, Vector{DataType}}, Tuple{String, DataType}}
     indentation_level::Int
 end
-type GTBlock
-    entry
-    block
-    out
-end
-GTBlock(entry) = GTBlock(entry, [], Nullable{GotoNode}())
+
 """
 Transpiled Expression
 """
@@ -126,11 +74,14 @@ function insert_buildins!(backend::GL)
         end
     end
     type_map[RGB{Float32}] = "vec3"
+    # TODO, don't just ignore Int64
+    type_map[Int64] = "int"
+    type_map[Bool] = "bool"
     type_map[RGBA{Float32}] = "vec4"
     merge!(backend.type_map, type_map)
     buildins = Dict(
         3 => Symbol[:round,:ceil,:trunc,:floor,:fma,:any,:all,:clamp],
-        2 => Symbol[:floor,:max,:any,:ldexp,:ceil,:normalize,:all,:log,:mod,:cross,:trunc,:round,:min],
+        2 => Symbol[:atan, :floor,:max,:any,:ldexp,:ceil,:normalize,:all,:log,:mod,:cross,:trunc,:round,:min],
         1 => Symbol[:atanh,:tanh,:exp2,:floor,:max,:any,:sin,:tan,:modf,:step,:log2,:acosh,:ceil,:normalize,:length,:atan,:all,:log,:isnan,:trunc,:asinh,:transpose,:abs,:frexp,:sqrt,:round,:sinh,:sign,:acos,:asin,:cosh,:exp,:min,:isinf,:cos]
     )
     ops = (
@@ -139,6 +90,7 @@ function insert_buildins!(backend::GL)
         "./" => "/",
         "*" => "*",
         "+" => "+",
+        "-" => "-",
         "/" => "/",
         # "div_float" => "/",
         # "sub_float" => "-",
@@ -171,6 +123,15 @@ function insert_buildins!(backend::GL)
     insert_function!(backend, "Float32", "float", [Int32] => Float32)
     insert_function!(backend, "Float32", "float", [UInt] => Float32)
     insert_function!(backend, "Float32", "float", [UInt32] => Float32)
+    insert_function!(backend, "Int32", "int", [UInt32] => Int32)
+    insert_function!(backend, "Int32", "int", [Int32] => Int32)
+    insert_function!(backend, "Int32", "int", [Float32] => Int32)
+    insert_function!(backend, "Int32", "int", [Int] => Int32)
+
+    insert_function!(backend, "Int64", "int", [UInt32] => Int64)
+    insert_function!(backend, "Int64", "int", [Int32] => Int64)
+    insert_function!(backend, "Int64", "int", [Float32] => Int64)
+    insert_function!(backend, "Int64", "int", [Int] => Int64)
 
     insert_function!(backend, "norm", "normalize", [Vec3f0] => Float32)
     insert_function!(backend, "^", "pow", [Float32, Float32] => Float32)
@@ -178,22 +139,61 @@ function insert_buildins!(backend::GL)
 
     insert_function!(backend, Symbol(Vec3f0), "vec3", [Float32, Float32, Float32] => Vec3f0)
     insert_function!(backend, Symbol(Vec3f0), "vec3", [Vec3f0] => Vec3f0)
-    insert_function!(backend, "<=", "<=", [Float32, Float32] => Bool)
+    bin_bool_ops = ("<", ">", "<=", ">=", "==", "&&", "||", "!=")
+    types = (Float32, Float64, Int64, Int32)
+    for T in types
+        for op in bin_bool_ops
+            insert_function!(backend, op, op, [T, T] => Bool)
+        end
+    end
+    insert_function!(backend, "!", "!", [Bool] => Bool)
     insert_function!(backend, ".*", "*", [Vec3f0, Float32] => Vec3f0)
     insert_function!(backend, ".*", "*", [Float32, Vec3f0] => Vec3f0)
     insert_function!(backend, "*", "*", [Vec3f0, Float32] => Vec3f0)
     insert_function!(backend, "*", "*", [Float32, Vec3f0] => Vec3f0)
-    insert_function!(GLBackend, "+", "+", [Vec3f0, Vec3f0, Vec3f0] => Vec3f0)
+    insert_function!(backend, "*", "*", [Float32, Float32, Float32] => Float32)
+    insert_function!(backend, "*", "*", [Float32, Float32] => Float32)
+
+    insert_function!(backend, "+", "+", [Vec3f0, Vec3f0, Vec3f0] => Vec3f0)
+    insert_function!(backend, "+", "+", [Float32, Float32, Float32] => Float32)
+    insert_function!(backend, "+", "+", [Float32, Float32] => Float32)
 
 end
+Base.atan(a,b) = atan2(a,b)
+"""
+`typeof` is a generic function so we use this one instead
+"""
+function glsl_typeof{T}(x::T)
+    T
+end
 
-const GLBackend = Backend(:GL)
-insert_buildins!(GLBackend)
+"""
+`glsl_ifelse` is not really supported in glsl
+"""
+function glsl_ifelse(condition, a, b)
+    if condition
+        return a
+    else
+        return b
+    end
+end
+
+
+const gl_backend = Backend(:GL)
+insert_buildins!(gl_backend)
 
 isbox(x) = (x == GlobalRef(Base, :box))
+extract_sym(T, x) = error("$x $(typeof(x)) cant be converted to Symbol")
+extract_sym{T}(::Type{T}, x::Int) = make_fieldname(fieldname(T, x))
+extract_sym(T, x::Symbol) = x
+extract_sym(T, x::QuoteNode) = x.value
+extract_sym(T, x) = error("$x $(typeof(x)) cant be converted to Symbol")
+
 extract_sym(x) = error("$x $(typeof(x)) cant be converted to Symbol")
+extract_sym(x::Int) = x
 extract_sym(x::Symbol) = x
 extract_sym(x::QuoteNode) = x.value
+
 get_types(x::AbstractVector) = map(slot_name_t -> slot_name_t[2][2], x)
 
 """
@@ -227,16 +227,24 @@ end
 function declare_block(backend::GL, source::String, level=backend.indentation_level)
     repeat("    ", level)*source*";\n"
 end
-function declare_composite_type(backend::GL, T::DataType)
-    name = to_type_name(T)
-    get!(backend.type_map, T) do
-        fields = [to_type_assert(backend, string(n), fieldtype(T, n)) for n in fieldnames(T)]
-        #TODO actualy insert this into declarations
-        println("""
+
+
+function declare_struct(backend, name, fnames, fieldtypes)
+    fields = [to_type_assert(backend, make_fieldname(n), t) for (n, t) in zip(fnames, fieldtypes)]
+    #TODO actualy insert this into declarations
+    println("""
 struct $(name){
 $(join(fields, ";\n"));
 };
-        """)
+    """)
+    name
+end
+function declare_composite_type(backend::GL, T::DataType)
+    name = to_type_name(T)
+    get!(backend.type_map, T) do
+        fnames = [n for n in 1:nfields(T)]
+        ftypes = map(n->fieldtype(T, n), fnames)
+        declare_struct(backend, name, fnames, ftypes)
         name
     end
 end
@@ -276,33 +284,22 @@ function transpile(backend::GL, f::Union{Function, Type}, types::AbstractVector)
     transpile(backend, f, tuple(types...))
 end
 
-function remove_static_param!(expr, static_parameters)
-    expr # leave any other untouched
-end
-function remove_static_param!(expr::Vector, static_parameters)
-    map!(e->remove_static_param!(e, static_parameters), expr)
-end
-function remove_static_param!(expr::Expr, static_parameters)
-    if expr.head == :static_parameter
-        idx = expr.args[1]
-        return static_parameters[idx]
-    else
-        remove_static_param!(expr.args, static_parameters)
-        expr
-    end
-end
+
 function transpile(backend::GL, f::Union{Function, Type}, types::Tuple)
     name, rettype = get!(backend.function_map, (string(Symbol(f)), [types...])) do
         func = FuncExpr(f, types)
         # convert slot types to glsl slot types
-        map!(func.slots) do slot_name_t
-            s, (n, t) = slot_name_t
-            if applicable(GLAbstraction.gl_promote, t)
-                t = GLAbstraction.gl_promote(t)
-            end
-            s, (n, t)
-        end
-        remove_static_param!(func.body, func.static_parameters)
+        # map!(func.slots) do slot_name_t
+        #     s, (n, t) = slot_name_t
+        #     if applicable(GLAbstraction.gl_promote, t)
+        #         t = GLAbstraction.gl_promote(t)
+        #     end
+        #     s, (n, t)
+        # end
+        #remove_static_param!(func.body, func.static_parameters)
+        nogotoexpr = remove_goto(func.body).args
+        empty!(func.body)
+        append!(func.body, nogotoexpr)
         push!(backend.current_slots, Dict(func.slots))
         decl = declare_function(backend, func)
         pop!(backend.current_slots)
@@ -311,143 +308,25 @@ function transpile(backend::GL, f::Union{Function, Type}, types::Tuple)
     name, rettype
 end
 
-function transpile(backend::GL, block::Expr)
-    if block.head == :block || block.head == :body
-        transpile(backend, block.args)
-    else
-        # I knoow, Val no good here... But it makes the function overwritable and composable, which might be nice
-        # in order to have unspecialized fall backs which can be specialized
-        #println("will transpile: $(block.head) ", block)
-        return transpile(backend, block, Val{block.head}())
-    end
-end
 
-
-function is_if(block::GTBlock)
-    (
-        isa(block.entry, Expr) &&
-        block.entry.head == :gotoifnot
-    )
-end
-function is_elseif(block::GTBlock)
-    (
-        isa(block.entry, Tuple) &&
-        isa(first(block.entry), LabelNode) &&
-        isa(last(block.entry), Expr) &&
-        last(block.entry).head == :gotoifnot
-    )
-end
-function is_else(block::GTBlock)
-    isa(block.entry, LabelNode) && isnull(block.out)
-end
-
-# (╯°□°）╯︵ ┻━┻
-function deal_with_goto(backend, elem, state, list, block_source)
-    labels = Set(Int[])
-    blocks = GTBlock[]
-    while true
-        if isa(elem, Expr) && elem.head == :gotoifnot
-            condition, label = elem.args
-            push!(labels, label)
-            push!(blocks, GTBlock(elem))
-        elseif (isa(elem, LabelNode) && elem.label in labels)
-            setdiff!(labels, elem.label)
-            isempty(labels) && break # found last label
-            elem0, state0 = elem, state
-            elem, state = next(list, state)
-            while isa(elem, LineNumberNode)
-                elem, state = next(list, state)
-            end
-            if !(isa(elem, Expr) && elem.head == :gotoifnot)
-                elem, state = elem0, state0 # reset peek
-                push!(blocks, GTBlock(elem))
-            else
-                push!(labels, elem.args[2])
-                push!(blocks, GTBlock((elem0, elem)))
-            end
-        elseif isa(elem, GotoNode)
-            last(blocks).out = Nullable(elem) #close block
-            push!(labels, elem.label)
-        elseif isa(elem, Expr) && elem.head == :gotoifnot
-            condition, label = elem.args
-            push!(labels, label)
-        else
-            push!(last(blocks).block, elem) # insert statements of block
-        end
-        done(list, state) && break
-        elem, state = next(list, state)
-    end
-    if done(list, state) && !isempty(labels)
-        error("Oh my... Couldn't find all goto labels")
-    end
-    indents = backend.indentation_level
-    indspace = repeat("    ", indents)
-    backend.indentation_level += 1
-    for block in blocks
-        bodysrc = source(transpile(backend, block.block))
-        if is_if(block)
-            cond = block.entry.args[1]
-            condsrc = source(transpile(backend, cond))
-            block_source *= """
-$(indspace)if($condsrc){
-$bodysrc
-$(indspace)}
-"""
-        elseif is_elseif(block)
-            cond = block.entry[2].args[1]
-            condsrc = source(transpile(backend, cond))
-            block_source *= """
-$(indspace)else if($condsrc){
-$bodysrc
-$(indspace)}
-"""
-        elseif is_else(block)
-            block_source *= """
-$(indspace)else{
-$bodysrc
-$(indspace)}
-"""
-        else
-            error("Block $block not supported yet")
-        end
-    end
-    backend.indentation_level = indents
-    elem, state = next(list, state) # move one after last labelnode
-    elem, state, block_source
-end
-
-function transpile(backend::GL, list::AbstractVector)
-    last_type = Any
-    block_source = ""
-    state = start(list)
-    while !done(list, state)
-        elem, state = next(list, state)
-        if isa(elem, Expr) && (elem.head == :gotoifnot || isa(elem, GotoNode))
-            elem, state, block_source = deal_with_goto(backend, elem, state, list, block_source)
-        end
-        line = transpile(backend, elem)
-        line == nothing && continue
-        block_source *= declare_block(backend, source(line))
-        last_type = returntype(line)
-    end
-    return TExpr(block_source, last_type)
-end
-
-
-transpile(backend::GL, expr::Void) = nothing
 
 function transpile(backend::GL, expr::LineNumberNode)
     TExpr("//julia source line: $(expr.line)", Void)
 end
+
 """
 concrete values
 """
-function transpile(backend::GL, value)
-    cnv_value = gl_convert(value)
-    TExpr(string(cnv_value), typeof(cnv_value))
+function transpile(backend::GL, value::Number)
+    #cnv_value = gl_convert(value)
+    TExpr(string(value), typeof(value))
 end
 
-function transpile(backend::GL, expr::Slot)
+function transpile(backend::GL, T::Type)
+    TExpr("Type{$T}", Type{T})
+end
+
+function transpile(backend::GL, expr::Union{Slot, SSAValue})
     src_t = last(backend.current_slots)[expr]
     TExpr(src_t...)
 end
@@ -455,11 +334,16 @@ function transpile(backend::GL, expr::Expr, ::Val{:(=)})
     lh, rh = map(x->transpile(backend, x), expr.args)
     TExpr("$(source(lh)) = $(source(rh))", Void)
 end
+function transpile(backend::GL, node::NewvarNode)
+    slot = node.slot
+    var_decl = last(backend.current_slots)[slot]
+    TExpr(var_decl...)
+end
 
 
 function transpile(backend::GL, expr::Expr, ::Val{:call})
     fun = shift!(expr.args)
-
+    @show fun expr.args
     if isbox(fun) # ignore boxes, LOL \( ﾟ◡ﾟ)/
         @assert length(expr.args) == 2
         ret_type, inner_expr = expr.args
@@ -471,20 +355,40 @@ function transpile(backend::GL, expr::Expr, ::Val{:call})
         @assert length(expr.args) == 2
         expr, field = expr.args
         expr_trp = transpile(backend, expr)
-        field_s = extract_sym(field)
         typ = returntype(expr_trp)
-        return TExpr("$(source(expr_trp)).$(field_s)", fieldtype(typ, field_s))
+        field_s = extract_sym(typ, field)
+        return TExpr("$(source(expr_trp)).$(field_s)", fieldtype(typ, extract_sym(field)))
     end
-    args = map(x->transpile(backend, x), expr.args)
+    if isa(fun, Expr)
+        if fun.args[1] == GlobalRef(Core, :apply_type)
+            tref = fun.args[2]
+            T = tref.mod.(tref.name)
+            fun = T{fun.args[3:end]...}
+        end
+    end
+    if fun == GlobalRef(Base, :ifelse)
+        fun = :glsl_ifelse
+    end
+    if fun == GlobalRef(Base, :typeof)
+        fun = :glsl_typeof
+    end
 
-    fun_name, return_type = transpile(backend, fun, returntype.(args))
+    args = map(x->transpile(backend, x), expr.args)
+    argtypes = returntype.(args)
     transpilat = source.(args)
+    if fun == GlobalRef(Core, :tuple)
+        tup = Tuple{argtypes...}
+        tname = to_type_name(tup)
+        src = "$tname($(join(transpilat, ", ")))"
+        return TExpr(src, tup)
+    end
+    fun_name, return_type = transpile(backend, fun, returntype.(args))
     call_expr = if Base.isoperator(Symbol(fun_name)) # most Julia operators should also be operators in GLSL
         if length(transpilat) == 1
-            "$(fun_name)$(transpilat[1])"
+            "$(fun_name)($(transpilat[1]))"
         else
             foldl(transpilat) do v0, v1
-                "$v0 $fun_name $v1"
+                "($v0 $fun_name $v1)"
             end
         end
     else
@@ -492,42 +396,56 @@ function transpile(backend::GL, expr::Expr, ::Val{:call})
     end
     TExpr(call_expr, return_type)
 end
-
+function transpile(backend::GL, expr::Expr, ::Val{:continue})
+    TExpr("continue", Void)
+end
+function transpile(backend::GL, expr::Expr, ::Val{:break})
+    TExpr("break", Void)
+end
 function transpile(backend::GL, expr::Expr, ::Val{:return})
     src = transpile(backend, expr.args[1])
     TExpr("return $(source(src))", returntype(src))
 end
-
-# Test
-
-function blinnphong4{NV, T}(light, L::Vec{NV, T}, N, V, color, shading)
-    diff_coeff = max(dot(L,N), T(0.0))
-    # specular coefficient
-    H = normalize(L+V)
-
-    spec_coeff = max(dot(H,N), 0.0)^(shading.shininess)
-    if diff_coeff <= 0.0
-        spec_coeff = 0.0
-    elseif diff_coeff <= 0.2
-        # some nonesense to test elseif
-        spec_coeff *= 2.0;
-        spec_coeff += 1.0;
-    else
-        spec_coeff = spec_coeff;
-        return L
+function transpile(backend::GL, expr::Expr, ::Val{:if})
+    indspace = "   "^backend.indentation_level
+    condition = transpile(backend, expr.args[1])
+    #@assert returntype(condition) <: Bool "$condition"
+    ifbody = source(transpile(backend, expr.args[2]))
+    block_source = """$(indspace)if($(source(condition))){
+$ifbody
+$(indspace)}"""
+    if length(expr.args) == 3
+        elsebody = source(transpile(backend, expr.args[3]))
+        block_source *= """else{
+$elsebody
+$(indspace)}"""
     end
-    # final lighting model
-    return Vec3f0(
-        light.ambient .* shading.ambient +
-        light.diffuse .* light.diffuse_power .* color * diff_coeff +
-        light.specular .* light.specular_power .* shading.specular * spec_coeff
-    )
+    TExpr(block_source, Void)
+end
+function transpile(backend::GL, expr::Expr, ::Val{:while})
+    indspace = "   "^backend.indentation_level
+    condition = transpile(backend, expr.args[1])
+    #@assert returntype(condition) <: Bool  "$condition"
+    whilebody = source(transpile(backend, expr.args[2]))
+    glslsource = """$(indspace)while($(source(condition))){
+$whilebody
+$(indspace)}"""
+    TExpr(glslsource, Void)
 end
 
-l = Light(Vec3f0(0), Vec3f0(0), Vec3f0(0), 1f0, Vec3f0(0), 1f0)
-s = Shading(Vec3f0(0), Vec3f0(0), 1f0)
-blinnphong3(l, Vec3f0(0), Vec3f0(0), Vec3f0(0), Vec3f0(0), s)
-fe = FuncExpr(blinnphong3, (Light{Float32},Vec3f0, Vec3f0, Vec3f0, Vec3f0,Shading{Float32}))
-fe.slots
-transpile(GLBackend, blinnphong4, (Light{Float32},Vec3f0, Vec3f0, Vec3f0, Vec3f0,Shading{Float32}))
-#delete!(GLBackend.function_map, ("blinnphong3", [Light{Float32},Vec3f0, Vec3f0, Vec3f0, Vec3f0,Shading{Float32}]))
+function _apply_type(expr)
+    @assert expr.head == :call
+    @assert expr.args[1] == GlobalRef(Core, :apply_type)
+    tref = expr.args[2]
+    T = tref.mod.(tref.name)
+    typ = T{expr.args[3:end]...}
+end
+function transpile(backend::GL, expr::Expr, ::Val{:new})
+    #push!(type_expr, expr)
+    applytype = expr.args[1]
+    T = _apply_type(applytype)
+    args_t = map(x->transpile(backend, x), expr.args[2:end])
+    transpilat = map(source, args_t)
+    tname = to_type_name(T)
+    TExpr("$(tname)($(join(transpilat, ", ")))", T)
+end
